@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.28;
 
-/// @title EventVoting
-/// @notice Create events with a stake and end date. Users vote yes/no by paying 10% of the stake.
+/// @title DebateVoting
+/// @notice Create debates with an end date. The creator must cast the first vote at creation
+/// and sets a fixed vote price. All voters (including the creator) pay this price per vote.
 /// After the end date, the side with more votes splits the losing side's vote pot equally.
-/// The creator can withdraw their original stake after finalization.
-contract EventVoting {
+
+contract StakeYourTake {
   enum Result { Pending, YesWin, NoWin, Tie }
 
   struct VoterInfo {
@@ -14,86 +15,88 @@ contract EventVoting {
     bool hasClaimed;
   }
 
-  struct EventInfo {
+  struct DebateInfo {
     address creator;
-    uint256 stake;
     uint64 endTime;
-    uint128 voteFee; // 10% of stake (stake / 10)
+    uint128 voteFee; // fixed price per vote decided by creator at creation
     uint128 yesCount;
     uint128 noCount;
     uint256 yesPot; // total wei paid by yes voters
     uint256 noPot;  // total wei paid by no voters
     bool finalized;
     Result result;
-    bool creatorStakeWithdrawn;
     uint256 residual; // leftover from integer division during splitting
   }
 
-  /// @dev eventId => voter => info
+  /// @dev debateId => voter => info
   mapping(uint256 => mapping(address => VoterInfo)) public voters;
-  EventInfo[] public events;
+  DebateInfo[] public debates;
 
-  event EventCreated(uint256 indexed eventId, address indexed creator, uint256 stake, uint64 endTime, uint128 voteFee);
-  event Voted(uint256 indexed eventId, address indexed voter, bool supportYes, uint128 newYesCount, uint128 newNoCount);
-  event Finalized(uint256 indexed eventId, Result result, uint256 yesPot, uint256 noPot, uint256 residual);
-  event Claimed(uint256 indexed eventId, address indexed voter, uint256 amount);
-  event CreatorStakeWithdrawn(uint256 indexed eventId, address indexed creator, uint256 amount, uint256 residual);
+  event DebateCreated(uint256 indexed debateId, address indexed creator, uint64 endTime, uint128 voteFee, bool supportYes);
+  event Voted(uint256 indexed debateId, address indexed voter, bool supportYes, uint128 newYesCount, uint128 newNoCount);
+  event Finalized(uint256 indexed debateId, Result result, uint256 yesPot, uint256 noPot, uint256 residual);
+  event Claimed(uint256 indexed debateId, address indexed voter, uint256 amount);
 
-  /// @notice Total number of created events
-  function totalEvents() external view returns (uint256) {
-    return events.length;
+  /// @notice Total number of created debates
+  function totalDebates() external view returns (uint256) {
+    return debates.length;
   }
 
-  /// @notice Create a new event by depositing a stake. Vote fee is 10% of the stake.
+  /// @notice Create a new debate. Creator must cast the first vote and set a fixed vote price.
   /// @param endTime Unix timestamp strictly greater than now.
-  /// @return eventId Index of the newly created event.
-  function createEvent(uint64 endTime) external payable returns (uint256 eventId) {
+  /// @param supportYes true if creator's first vote supports YES, false for NO.
+  /// @param voteFee Fixed price per vote in wei (must equal msg.value at creation).
+  /// @return debateId Index of the newly created debate.
+  function createDebate(uint64 endTime, bool supportYes, uint128 voteFee) external payable returns (uint256 debateId) {
     require(endTime > block.timestamp, "endTime must be in the future");
-    require(msg.value > 0, "stake must be > 0");
+    require(voteFee > 0, "vote price must be > 0");
+    require(msg.value == uint256(voteFee), "incorrect vote price");
 
-    uint128 fee = uint128(msg.value / 10); // 10% of stake
-    require(fee > 0, "stake too small for 10% fee");
-
-    EventInfo memory info = EventInfo({
+    DebateInfo memory info = DebateInfo({
       creator: msg.sender,
-      stake: msg.value,
       endTime: endTime,
-      voteFee: fee,
-      yesCount: 0,
-      noCount: 0,
-      yesPot: 0,
-      noPot: 0,
+      voteFee: voteFee,
+      yesCount: supportYes ? 1 : 0,
+      noCount: supportYes ? 0 : 1,
+      yesPot: supportYes ? uint256(voteFee) : 0,
+      noPot: supportYes ? 0 : uint256(voteFee),
       finalized: false,
       result: Result.Pending,
-      creatorStakeWithdrawn: false,
       residual: 0
     });
 
-    events.push(info);
-    eventId = events.length - 1;
-    emit EventCreated(eventId, msg.sender, msg.value, endTime, fee);
+    debates.push(info);
+    debateId = debates.length - 1;
+
+    // Mark creator as having voted
+    VoterInfo storage v = voters[debateId][msg.sender];
+    v.hasVoted = true;
+    v.supportYes = supportYes;
+
+    emit DebateCreated(debateId, msg.sender, endTime, voteFee, supportYes);
+    emit Voted(debateId, msg.sender, supportYes, debates[debateId].yesCount, debates[debateId].noCount);
   }
 
-  /// @notice Get the vote fee (10% of stake) for an event.
-  function getVoteFee(uint256 eventId) public view returns (uint128) {
-    require(eventId < events.length, "invalid eventId");
-    return events[eventId].voteFee;
+  /// @notice Get the vote price for a debate.
+  function getVoteFee(uint256 debateId) public view returns (uint128) {
+    require(debateId < debates.length, "invalid debateId");
+    return debates[debateId].voteFee;
   }
 
-  /// @notice Vote yes/no for an event. Each address can vote once per event.
-  /// @param eventId The id of the event.
+  /// @notice Vote yes/no for a debate. Each address can vote once per debate.
+  /// @param debateId The id of the debate.
   /// @param supportYes true for yes, false for no.
-  function vote(uint256 eventId, bool supportYes) external payable {
-    require(eventId < events.length, "invalid eventId");
-    EventInfo storage info = events[eventId];
-    require(block.timestamp < info.endTime, "event ended");
+  function vote(uint256 debateId, bool supportYes) external payable {
+    require(debateId < debates.length, "invalid debateId");
+    DebateInfo storage info = debates[debateId];
+    require(block.timestamp < info.endTime, "debate ended");
     require(!info.finalized, "already finalized");
 
-    VoterInfo storage v = voters[eventId][msg.sender];
+    VoterInfo storage v = voters[debateId][msg.sender];
     require(!v.hasVoted, "already voted");
 
     uint128 fee = info.voteFee;
-    require(msg.value == fee, "incorrect vote fee");
+    require(msg.value == fee, "incorrect vote price");
 
     v.hasVoted = true;
     v.supportYes = supportYes;
@@ -106,13 +109,13 @@ contract EventVoting {
       info.noPot += msg.value;
     }
 
-    emit Voted(eventId, msg.sender, supportYes, info.yesCount, info.noCount);
+    emit Voted(debateId, msg.sender, supportYes, info.yesCount, info.noCount);
   }
 
-  /// @notice Finalize an event after endTime to set the result and compute residuals.
-  function finalize(uint256 eventId) public {
-    require(eventId < events.length, "invalid eventId");
-    EventInfo storage info = events[eventId];
+  /// @notice Finalize a debate after endTime to set the result and compute residuals.
+  function finalize(uint256 debateId) public {
+    require(debateId < debates.length, "invalid debateId");
+    DebateInfo storage info = debates[debateId];
     require(block.timestamp >= info.endTime, "not ended yet");
     require(!info.finalized, "already finalized");
 
@@ -137,16 +140,16 @@ contract EventVoting {
     }
 
     info.finalized = true;
-    emit Finalized(eventId, info.result, info.yesPot, info.noPot, info.residual);
+    emit Finalized(debateId, info.result, info.yesPot, info.noPot, info.residual);
   }
 
   /// @notice Claim your payout (or refund on tie) after finalization.
-  function claim(uint256 eventId) external {
-    require(eventId < events.length, "invalid eventId");
-    EventInfo storage info = events[eventId];
+  function claim(uint256 debateId) external {
+    require(debateId < debates.length, "invalid debateId");
+    DebateInfo storage info = debates[debateId];
     require(info.finalized, "not finalized");
 
-    VoterInfo storage v = voters[eventId][msg.sender];
+    VoterInfo storage v = voters[debateId][msg.sender];
     require(v.hasVoted, "not a voter");
     require(!v.hasClaimed, "already claimed");
 
@@ -177,29 +180,16 @@ contract EventVoting {
       require(ok, "transfer failed");
     }
 
-    emit Claimed(eventId, msg.sender, amount);
+    emit Claimed(debateId, msg.sender, amount);
   }
 
   /// @notice Withdraw the creator's original stake after finalization.
-  function withdrawCreatorStake(uint256 eventId) external {
-    require(eventId < events.length, "invalid eventId");
-    EventInfo storage info = events[eventId];
-    require(info.finalized, "not finalized");
-    require(msg.sender == info.creator, "not creator");
-    require(!info.creatorStakeWithdrawn, "stake withdrawn");
-
-    info.creatorStakeWithdrawn = true;
-
-    uint256 amount = info.stake;
-    (bool ok, ) = info.creator.call{value: amount}("");
-    require(ok, "stake transfer failed");
-    emit CreatorStakeWithdrawn(eventId, info.creator, amount, 0);
-  }
+  // removed: original stake mechanism no longer exists
 
   /// @notice Withdraw any residual wei from integer division after finalization (creator only).
-  function withdrawResidual(uint256 eventId) external {
-    require(eventId < events.length, "invalid eventId");
-    EventInfo storage info = events[eventId];
+  function withdrawResidual(uint256 debateId) external {
+    require(debateId < debates.length, "invalid debateId");
+    DebateInfo storage info = debates[debateId];
     require(info.finalized, "not finalized");
     require(msg.sender == info.creator, "not creator");
 
