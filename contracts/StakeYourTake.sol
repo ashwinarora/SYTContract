@@ -1,12 +1,25 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.28;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 /// @title DebateVoting
 /// @notice Create debates with an end date. The creator must cast the first vote at creation
 /// and sets a fixed vote price. All voters (including the creator) pay this price per vote.
 /// After the end date, the side with more votes splits the losing side's vote pot equally.
 
 contract StakeYourTake {
+  using SafeERC20 for IERC20;
+
+  /// @notice ERC20 token used for all payments in this contract
+  IERC20 public immutable token;
+
+  /// @param tokenAddress ERC20 token address used for paying vote fees and rewards
+  constructor(address tokenAddress) {
+    require(tokenAddress != address(0), "token is zero");
+    token = IERC20(tokenAddress);
+  }
   enum Result { Pending, YesWin, NoWin, Tie }
 
   struct VoterInfo {
@@ -18,14 +31,14 @@ contract StakeYourTake {
   struct DebateInfo {
     address creator;
     uint64 endTime;
-    uint128 voteFee; // fixed price per vote decided by creator at creation
+    uint128 voteFee; // fixed price per vote in token units decided by creator at creation
     uint128 yesCount;
     uint128 noCount;
-    uint256 yesPot; // total wei paid by yes voters
-    uint256 noPot;  // total wei paid by no voters
+    uint256 yesPot; // total tokens paid by yes voters
+    uint256 noPot;  // total tokens paid by no voters
     bool finalized;
     Result result;
-    uint256 residual; // leftover from integer division during splitting
+    uint256 residual; // leftover tokens from integer division during splitting
   }
 
   /// @dev debateId => voter => info
@@ -45,12 +58,14 @@ contract StakeYourTake {
   /// @notice Create a new debate. Creator must cast the first vote and set a fixed vote price.
   /// @param endTime Unix timestamp strictly greater than now.
   /// @param supportYes true if creator's first vote supports YES, false for NO.
-  /// @param voteFee Fixed price per vote in wei (must equal msg.value at creation).
+  /// @param voteFee Fixed price per vote in token units (must be transferred at creation).
   /// @return debateId Index of the newly created debate.
-  function createDebate(uint64 endTime, bool supportYes, uint128 voteFee) external payable returns (uint256 debateId) {
+  function createDebate(uint64 endTime, bool supportYes, uint128 voteFee) external returns (uint256 debateId) {
     require(endTime > block.timestamp, "endTime must be in the future");
     require(voteFee > 0, "vote price must be > 0");
-    require(msg.value == uint256(voteFee), "incorrect vote price");
+
+    // Pull creator's first vote fee in tokens
+    token.safeTransferFrom(msg.sender, address(this), uint256(voteFee));
 
     DebateInfo memory info = DebateInfo({
       creator: msg.sender,
@@ -86,7 +101,7 @@ contract StakeYourTake {
   /// @notice Vote yes/no for a debate. Each address can vote once per debate.
   /// @param debateId The id of the debate.
   /// @param supportYes true for yes, false for no.
-  function vote(uint256 debateId, bool supportYes) external payable {
+  function vote(uint256 debateId, bool supportYes) external {
     require(debateId < debates.length, "invalid debateId");
     DebateInfo storage info = debates[debateId];
     require(block.timestamp < info.endTime, "debate ended");
@@ -96,17 +111,18 @@ contract StakeYourTake {
     require(!v.hasVoted, "already voted");
 
     uint128 fee = info.voteFee;
-    require(msg.value == fee, "incorrect vote price");
+    // Pull voter's fee in tokens
+    token.safeTransferFrom(msg.sender, address(this), uint256(fee));
 
     v.hasVoted = true;
     v.supportYes = supportYes;
 
     if (supportYes) {
       info.yesCount += 1;
-      info.yesPot += msg.value;
+      info.yesPot += uint256(fee);
     } else {
       info.noCount += 1;
-      info.noPot += msg.value;
+      info.noPot += uint256(fee);
     }
 
     emit Voted(debateId, msg.sender, supportYes, info.yesCount, info.noCount);
@@ -176,8 +192,7 @@ contract StakeYourTake {
     v.hasClaimed = true;
 
     if (amount > 0) {
-      (bool ok, ) = msg.sender.call{value: amount}("");
-      require(ok, "transfer failed");
+      token.safeTransfer(msg.sender, amount);
     }
 
     emit Claimed(debateId, msg.sender, amount);
@@ -186,7 +201,7 @@ contract StakeYourTake {
   /// @notice Withdraw the creator's original stake after finalization.
   // removed: original stake mechanism no longer exists
 
-  /// @notice Withdraw any residual wei from integer division after finalization (creator only).
+  /// @notice Withdraw any residual tokens from integer division after finalization (creator only).
   function withdrawResidual(uint256 debateId) external {
     require(debateId < debates.length, "invalid debateId");
     DebateInfo storage info = debates[debateId];
@@ -196,8 +211,7 @@ contract StakeYourTake {
     uint256 amount = info.residual;
     require(amount > 0, "no residual");
     info.residual = 0;
-    (bool ok, ) = info.creator.call{value: amount}("");
-    require(ok, "residual transfer failed");
+    token.safeTransfer(info.creator, amount);
   }
 }
 
